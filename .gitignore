@@ -1,2 +1,8 @@
 # venv
 venv/*
+
+# .env
+.env
+
+# data/
+data/
