@@ -15,6 +15,7 @@ except ImportError:  # Python 3.8 이하
     from backports.zoneinfo import ZoneInfo  # pip install backports.zoneinfo
 
 from dotenv import load_dotenv
+from typing import List, Dict
 
 # =========================
 # 환경변수 로드 (.env)
@@ -93,7 +94,7 @@ def fetch_route_xml(route_id: str) -> str:
     raise RuntimeError(f"Failed route_id={route_id}: {last_err}")
 
 
-def parse_items_from_xml(xml_text: str) -> list[dict]:
+def parse_items_from_xml(xml_text: str) -> List[Dict]:
     """
     C 개선: headerCd 체크
     """
@@ -113,7 +114,7 @@ def parse_items_from_xml(xml_text: str) -> list[dict]:
     return items
 
 
-def get_existing_csv_columns(csv_path: Path) -> list[str]:
+def get_existing_csv_columns(csv_path: Path) -> List[str]:
     """
     B 개선: 기존 CSV 헤더 읽기
     (파일이 없으면 빈 리스트)
@@ -128,7 +129,7 @@ def get_existing_csv_columns(csv_path: Path) -> list[str]:
         return []
 
 
-def append_rows_to_daily_csv(rows: list[dict], ts: datetime) -> Path | None:
+def append_rows_to_daily_csv(rows: List[Dict], ts: datetime):
     """
     A: ts 기준 날짜 파일에 저장
     B: 컬럼 흔들림 방지 (기존 헤더 + 새 헤더 합집합으로 맞춤)
