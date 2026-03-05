@@ -9,10 +9,8 @@ import pandas as pd
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 # --- zoneinfo 처리: 3.9+면 zoneinfo, 아니면 backports.zoneinfo ---
-try:
-    from zoneinfo import ZoneInfo  # Python 3.9+
-except ImportError:  # Python 3.8 이하
-    from backports.zoneinfo import ZoneInfo  # pip install backports.zoneinfo
+
+from backports.zoneinfo import ZoneInfo  # pip install backports.zoneinfo
 
 from dotenv import load_dotenv
 from typing import List, Dict
@@ -48,7 +46,7 @@ ROUTE_IDS = [
 ]
 
 DATA_DIR = Path("data")
-PER_REQUEST_SLEEP_SEC = 0.2
+PER_REQUEST_SLEEP_SEC = 1.2
 TIMEOUT = (5, 15)
 RETRIES = 2
 KST = ZoneInfo("Asia/Seoul")
