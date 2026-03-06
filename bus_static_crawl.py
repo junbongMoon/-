@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 import requests
 import pandas as pd
 from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.executors.pool import ThreadPoolExecutor  # ✅ 추가
 
 # --- zoneinfo 처리: 3.9+면 zoneinfo, 아니면 backports.zoneinfo ---
 try:
@@ -64,10 +65,13 @@ SPECIAL_EVENING_ONLY = [  # 18:00~21:00만
 ]
 
 DATA_DIR = Path("data")
-PER_REQUEST_SLEEP_SEC = 1.5  
+PER_REQUEST_SLEEP_SEC = 10.0 # 3초로 슬립 늘림
 TIMEOUT = (5, 15)
-RETRIES = 2
+RETRIES = 0 # 호출재시도 안함
 KST = ZoneInfo("Asia/Seoul")
+
+# ✅ 호출 제한 걸렸을 때 쿨다운(초) + 해당 회차 중단
+RATE_LIMIT_COOLDOWN_SEC = 600
 
 
 # =========================
@@ -207,8 +211,16 @@ def collect_routes(route_ids: List[str], label: str):
 
         except Exception as e:
             fail += 1
+            msg = str(e)
             print(f"  ❌ {route_id} error -> {e}")
 
+            # ✅ 호출 제한(headerCd=7 등) 감지 시: 쿨다운 후 이번 회차 중단
+            if ("LIMITED NUMBER OF SERVICE REQUESTS EXCEEDS" in msg) or ("headerCd=7" in msg):
+                print(f"  🧊 Rate limit detected. Cooldown {RATE_LIMIT_COOLDOWN_SEC}s then stop this run.")
+                time.sleep(RATE_LIMIT_COOLDOWN_SEC)
+                break
+
+        # ✅ 요청 간 텀
         time.sleep(PER_REQUEST_SLEEP_SEC)
 
     done_at = now_kst().strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -224,19 +236,19 @@ def collect_routes(route_ids: List[str], label: str):
 def main():
     ensure_dir(DATA_DIR)
 
+    # ✅ 동시에 job 1개만 실행되도록 강제 (CORE 돌 때 SPECIAL이 끼어들지 않음)
     scheduler = BlockingScheduler(
         timezone=KST,
+        executors={"default": ThreadPoolExecutor(1)},
         job_defaults={
             "coalesce": True,      # 밀린 작업은 합쳐서 1번만
-            "max_instances": 1,    # 동시에 중복 실행 방지
+            "max_instances": 1,    # 같은 job의 중복 실행 방지
             "misfire_grace_time": 60
         }
     )
 
     # -------------------------
-    # 1) CORE_ROUTES: 출퇴근 2분
-    # - 출근: 06:00~10:59 (*/2)
-    # - 퇴근: 16:30~16:59 (30-59/2), 17:00~20:59 (*/2), 21:00 (0)
+    # 1) CORE_ROUTES: 출퇴근 2분 (second=0)
     # -------------------------
     scheduler.add_job(
         lambda: collect_routes(CORE_ROUTES, "CORE 2-min MORNING"),
@@ -273,13 +285,7 @@ def main():
     )
 
     # -------------------------
-    # 2) CORE_ROUTES: 그 외 5분
-    # - 00:00~02:59  (*/5)
-    # - 05:00~05:59  (*/5)
-    # - 11:00~15:59  (*/5)
-    # - 16:00~16:29  (0-29/5)
-    # - 21:05~21:59  (5-59/5)
-    # - 22:00~23:59  (*/5)
+    # 2) CORE_ROUTES: 그 외 5분 (second=0)
     # -------------------------
     scheduler.add_job(
         lambda: collect_routes(CORE_ROUTES, "CORE 5-min (00~02)"),
@@ -331,7 +337,7 @@ def main():
     )
 
     # -------------------------
-    # 3) SPECIAL 출근: 06:30~10:00만 (2분)
+    # 3) SPECIAL 출근: 06:30~10:00만 (2분)  ✅ second=30으로 CORE와 분리
     # -------------------------
     scheduler.add_job(
         lambda: collect_routes(SPECIAL_MORNING_ONLY, "SPECIAL MORNING 2-min (06:30~06:59)"),
@@ -339,7 +345,7 @@ def main():
         day_of_week="mon-fri",
         hour="6",
         minute="30-59/2",
-        second=0,
+        second=30,
     )
     scheduler.add_job(
         lambda: collect_routes(SPECIAL_MORNING_ONLY, "SPECIAL MORNING 2-min (07~09)"),
@@ -347,7 +353,7 @@ def main():
         day_of_week="mon-fri",
         hour="7-9",
         minute="*/2",
-        second=0,
+        second=30,
     )
     scheduler.add_job(
         lambda: collect_routes(SPECIAL_MORNING_ONLY, "SPECIAL MORNING END (10:00)"),
@@ -355,11 +361,11 @@ def main():
         day_of_week="mon-fri",
         hour="10",
         minute="0",
-        second=0,
+        second=30,
     )
 
     # -------------------------
-    # 4) SPECIAL 퇴근: 18:00~21:00만 (2분)
+    # 4) SPECIAL 퇴근: 18:00~21:00만 (2분) ✅ second=30
     # -------------------------
     scheduler.add_job(
         lambda: collect_routes(SPECIAL_EVENING_ONLY, "SPECIAL EVENING 2-min (18~20)"),
@@ -367,7 +373,7 @@ def main():
         day_of_week="mon-fri",
         hour="18-20",
         minute="*/2",
-        second=0,
+        second=30,
     )
     scheduler.add_job(
         lambda: collect_routes(SPECIAL_EVENING_ONLY, "SPECIAL EVENING END (21:00)"),
@@ -375,12 +381,13 @@ def main():
         day_of_week="mon-fri",
         hour="21",
         minute="0",
-        second=0,
+        second=30,
     )
 
     print("Scheduler started.")
     print(" - Weekdays only (Mon~Fri), no weekends, no holidays (if holidays pkg installed).")
     print(f"Saving CSV under: {DATA_DIR.resolve()}")
+    print(f"PER_REQUEST_SLEEP_SEC={PER_REQUEST_SLEEP_SEC}, RATE_LIMIT_COOLDOWN_SEC={RATE_LIMIT_COOLDOWN_SEC}")
 
     try:
         scheduler.start()
