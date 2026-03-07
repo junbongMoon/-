@@ -7,7 +7,7 @@ import xml.etree.ElementTree as ET
 import requests
 import pandas as pd
 from apscheduler.schedulers.blocking import BlockingScheduler
-from apscheduler.executors.pool import ThreadPoolExecutor  # ✅ 추가
+from apscheduler.executors.pool import ThreadPoolExecutor
 
 # --- zoneinfo 처리: 3.9+면 zoneinfo, 아니면 backports.zoneinfo ---
 try:
@@ -42,7 +42,7 @@ if not SERVICE_KEY:
     raise RuntimeError("환경변수 BUS_API_KEY가 없습니다. .env 또는 환경변수를 설정하세요.")
 
 # --- 노선 분류 ---
-CORE_ROUTES = [  # 항상 수집 대상(단, 시간별 주기 다름)
+CORE_ROUTES = [  # 항상 수집 대상(주말/공휴일 포함)
     "100100389",  # 9401
     "113000004",  # 9401-1
     "100100391",  # 9404
@@ -52,25 +52,25 @@ CORE_ROUTES = [  # 항상 수집 대상(단, 시간별 주기 다름)
     "100100607",  # 9711
 ]
 
-SPECIAL_MORNING_ONLY = [  # 06:30~10:00만
+SPECIAL_MORNING_ONLY = [  # 평일 06:30~10:00만
     "107000006",  # 서울01출근
     "111000020",  # 서울03출근
     "113000005",  # 서울06출근
 ]
 
-SPECIAL_EVENING_ONLY = [  # 18:00~21:00만
+SPECIAL_EVENING_ONLY = [  # 평일 18:00~21:00만
     "107000010",  # 서울01퇴근
     "111000024",  # 서울03퇴근
     "109000005",  # 서울06퇴근
 ]
 
 DATA_DIR = Path("data")
-PER_REQUEST_SLEEP_SEC = 10.0 # 3초로 슬립 늘림
+PER_REQUEST_SLEEP_SEC = 10.0
 TIMEOUT = (5, 15)
-RETRIES = 0 # 호출재시도 안함
+RETRIES = 0
 KST = ZoneInfo("Asia/Seoul")
 
-# ✅ 호출 제한 걸렸을 때 쿨다운(초) + 해당 회차 중단
+# 호출 제한 감지 시 쿨다운
 RATE_LIMIT_COOLDOWN_SEC = 600
 
 
@@ -85,10 +85,11 @@ def is_workday_kst(ts: datetime) -> bool:
     # 토/일 제외
     if ts.weekday() >= 5:
         return False
-    # 공휴일 제외(패키지 없으면 패스)
-    if KR_HOLIDAYS is not None:
-        if ts.date() in KR_HOLIDAYS:
-            return False
+
+    # 공휴일 제외(패키지 있을 때만)
+    if KR_HOLIDAYS is not None and ts.date() in KR_HOLIDAYS:
+        return False
+
     return True
 
 
@@ -102,7 +103,10 @@ def daily_csv_path(ts: datetime) -> Path:
 
 
 def fetch_route_xml(route_id: str) -> str:
-    params = {"serviceKey": SERVICE_KEY, "busRouteId": route_id}
+    params = {
+        "serviceKey": SERVICE_KEY,
+        "busRouteId": route_id
+    }
 
     last_err = None
     for attempt in range(RETRIES + 1):
@@ -127,6 +131,7 @@ def parse_items_from_xml(xml_text: str) -> List[Dict]:
 
     header_cd = (root.findtext(".//msgHeader/headerCd") or "").strip()
     header_msg = (root.findtext(".//msgHeader/headerMsg") or "").strip()
+
     if header_cd and header_cd != "0":
         raise RuntimeError(f"API error headerCd={header_cd}, msg={header_msg}")
 
@@ -136,12 +141,14 @@ def parse_items_from_xml(xml_text: str) -> List[Dict]:
         for child in item:
             row[child.tag] = (child.text or "").strip()
         items.append(row)
+
     return items
 
 
 def get_existing_csv_columns(csv_path: Path) -> List[str]:
     if not csv_path.exists():
         return []
+
     try:
         return list(pd.read_csv(csv_path, nrows=0, encoding="utf-8-sig").columns)
     except Exception:
@@ -172,18 +179,24 @@ def append_rows_to_daily_csv(rows: List[Dict], ts: datetime):
     df = df[union_cols]
 
     write_header = not csv_path.exists()
-    df.to_csv(csv_path, mode="a", index=False, header=write_header, encoding="utf-8-sig")
+    df.to_csv(
+        csv_path,
+        mode="a",
+        index=False,
+        header=write_header,
+        encoding="utf-8-sig"
+    )
     return csv_path
 
 
 # =========================
-# 수집 실행(노선 리스트 인자로)
+# 수집 실행
 # =========================
-def collect_routes(route_ids: List[str], label: str):
+def collect_routes(route_ids: List[str], label: str, skip_on_holiday: bool = False):
     ts0 = now_kst()
 
-    # ✅ 토/일/공휴일 스킵
-    if not is_workday_kst(ts0):
+    # SPECIAL 전용: 주말/공휴일이면 스킵
+    if skip_on_holiday and not is_workday_kst(ts0):
         print(f"\n[{ts0.strftime('%Y-%m-%d %H:%M:%S %Z')}] SKIP (weekend/holiday) | {label}")
         return
 
@@ -214,13 +227,12 @@ def collect_routes(route_ids: List[str], label: str):
             msg = str(e)
             print(f"  ❌ {route_id} error -> {e}")
 
-            # ✅ 호출 제한(headerCd=7 등) 감지 시: 쿨다운 후 이번 회차 중단
+            # 호출 제한 감지 시 이번 회차 중단
             if ("LIMITED NUMBER OF SERVICE REQUESTS EXCEEDS" in msg) or ("headerCd=7" in msg):
                 print(f"  🧊 Rate limit detected. Cooldown {RATE_LIMIT_COOLDOWN_SEC}s then stop this run.")
                 time.sleep(RATE_LIMIT_COOLDOWN_SEC)
                 break
 
-        # ✅ 요청 간 텀
         time.sleep(PER_REQUEST_SLEEP_SEC)
 
     done_at = now_kst().strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -231,163 +243,187 @@ def collect_routes(route_ids: List[str], label: str):
 
 
 # =========================
-# main: 스케줄 분리 등록
+# main
 # =========================
 def main():
     ensure_dir(DATA_DIR)
 
-    # ✅ 동시에 job 1개만 실행되도록 강제 (CORE 돌 때 SPECIAL이 끼어들지 않음)
     scheduler = BlockingScheduler(
         timezone=KST,
         executors={"default": ThreadPoolExecutor(1)},
         job_defaults={
-            "coalesce": True,      # 밀린 작업은 합쳐서 1번만
-            "max_instances": 1,    # 같은 job의 중복 실행 방지
+            "coalesce": True,
+            "max_instances": 1,
             "misfire_grace_time": 60
         }
     )
 
-    # -------------------------
-    # 1) CORE_ROUTES: 출퇴근 2분 (second=0)
-    # -------------------------
+    # =====================================================
+    # 1) CORE_ROUTES
+    #    - 주말/공휴일 포함 계속 수집
+    #    - 그래서 day_of_week 제거
+    # =====================================================
+
+    # 2분 수집: 아침
     scheduler.add_job(
         lambda: collect_routes(CORE_ROUTES, "CORE 2-min MORNING"),
         trigger="cron",
-        day_of_week="mon-fri",
         hour="6-10",
         minute="*/2",
         second=0,
     )
 
+    # 2분 수집: 저녁
     scheduler.add_job(
         lambda: collect_routes(CORE_ROUTES, "CORE 2-min EVENING (16:30~16:59)"),
         trigger="cron",
-        day_of_week="mon-fri",
         hour="16",
         minute="30-59/2",
         second=0,
     )
+
     scheduler.add_job(
         lambda: collect_routes(CORE_ROUTES, "CORE 2-min EVENING (17~20)"),
         trigger="cron",
-        day_of_week="mon-fri",
         hour="17-20",
         minute="*/2",
         second=0,
     )
+
     scheduler.add_job(
         lambda: collect_routes(CORE_ROUTES, "CORE EVENING END (21:00)"),
         trigger="cron",
-        day_of_week="mon-fri",
         hour="21",
         minute="0",
         second=0,
     )
 
-    # -------------------------
-    # 2) CORE_ROUTES: 그 외 5분 (second=0)
-    # -------------------------
+    # 5분 수집: 나머지 시간대
     scheduler.add_job(
         lambda: collect_routes(CORE_ROUTES, "CORE 5-min (00~02)"),
         trigger="cron",
-        day_of_week="mon-fri",
         hour="0-2",
         minute="*/5",
         second=0,
     )
+
     scheduler.add_job(
         lambda: collect_routes(CORE_ROUTES, "CORE 5-min (05)"),
         trigger="cron",
-        day_of_week="mon-fri",
         hour="5",
         minute="*/5",
         second=0,
     )
+
     scheduler.add_job(
         lambda: collect_routes(CORE_ROUTES, "CORE 5-min (11~15)"),
         trigger="cron",
-        day_of_week="mon-fri",
         hour="11-15",
         minute="*/5",
         second=0,
     )
+
     scheduler.add_job(
         lambda: collect_routes(CORE_ROUTES, "CORE 5-min (16:00~16:29)"),
         trigger="cron",
-        day_of_week="mon-fri",
         hour="16",
         minute="0-29/5",
         second=0,
     )
+
     scheduler.add_job(
         lambda: collect_routes(CORE_ROUTES, "CORE 5-min (21:05~21:59)"),
         trigger="cron",
-        day_of_week="mon-fri",
         hour="21",
         minute="5-59/5",
         second=0,
     )
+
     scheduler.add_job(
         lambda: collect_routes(CORE_ROUTES, "CORE 5-min (22~23)"),
         trigger="cron",
-        day_of_week="mon-fri",
         hour="22-23",
         minute="*/5",
         second=0,
     )
 
-    # -------------------------
-    # 3) SPECIAL 출근: 06:30~10:00만 (2분)  ✅ second=30으로 CORE와 분리
-    # -------------------------
+    # =====================================================
+    # 2) SPECIAL_MORNING_ONLY
+    #    - 스케줄은 걸어두되, 주말/공휴일이면 함수 내부에서 스킵
+    # =====================================================
     scheduler.add_job(
-        lambda: collect_routes(SPECIAL_MORNING_ONLY, "SPECIAL MORNING 2-min (06:30~06:59)"),
+        lambda: collect_routes(
+            SPECIAL_MORNING_ONLY,
+            "SPECIAL MORNING 2-min (06:30~06:59)",
+            skip_on_holiday=True
+        ),
         trigger="cron",
-        day_of_week="mon-fri",
         hour="6",
         minute="30-59/2",
         second=30,
     )
+
     scheduler.add_job(
-        lambda: collect_routes(SPECIAL_MORNING_ONLY, "SPECIAL MORNING 2-min (07~09)"),
+        lambda: collect_routes(
+            SPECIAL_MORNING_ONLY,
+            "SPECIAL MORNING 2-min (07~09)",
+            skip_on_holiday=True
+        ),
         trigger="cron",
-        day_of_week="mon-fri",
         hour="7-9",
         minute="*/2",
         second=30,
     )
+
     scheduler.add_job(
-        lambda: collect_routes(SPECIAL_MORNING_ONLY, "SPECIAL MORNING END (10:00)"),
+        lambda: collect_routes(
+            SPECIAL_MORNING_ONLY,
+            "SPECIAL MORNING END (10:00)",
+            skip_on_holiday=True
+        ),
         trigger="cron",
-        day_of_week="mon-fri",
         hour="10",
         minute="0",
         second=30,
     )
 
-    # -------------------------
-    # 4) SPECIAL 퇴근: 18:00~21:00만 (2분) ✅ second=30
-    # -------------------------
+    # =====================================================
+    # 3) SPECIAL_EVENING_ONLY
+    #    - 스케줄은 걸어두되, 주말/공휴일이면 함수 내부에서 스킵
+    # =====================================================
     scheduler.add_job(
-        lambda: collect_routes(SPECIAL_EVENING_ONLY, "SPECIAL EVENING 2-min (18~20)"),
+        lambda: collect_routes(
+            SPECIAL_EVENING_ONLY,
+            "SPECIAL EVENING 2-min (18~20)",
+            skip_on_holiday=True
+        ),
         trigger="cron",
-        day_of_week="mon-fri",
         hour="18-20",
         minute="*/2",
         second=30,
     )
+
     scheduler.add_job(
-        lambda: collect_routes(SPECIAL_EVENING_ONLY, "SPECIAL EVENING END (21:00)"),
+        lambda: collect_routes(
+            SPECIAL_EVENING_ONLY,
+            "SPECIAL EVENING END (21:00)",
+            skip_on_holiday=True
+        ),
         trigger="cron",
-        day_of_week="mon-fri",
         hour="21",
         minute="0",
         second=30,
     )
 
     print("Scheduler started.")
-    print(" - Weekdays only (Mon~Fri), no weekends, no holidays (if holidays pkg installed).")
+    print(" - CORE: runs every day including weekends/holidays.")
+    print(" - SPECIAL: skipped on weekends/holidays.")
     print(f"Saving CSV under: {DATA_DIR.resolve()}")
     print(f"PER_REQUEST_SLEEP_SEC={PER_REQUEST_SLEEP_SEC}, RATE_LIMIT_COOLDOWN_SEC={RATE_LIMIT_COOLDOWN_SEC}")
+
+    print("\n[Registered Jobs]")
+    for job in scheduler.get_jobs():
+        print(f" - {job}")
 
     try:
         scheduler.start()
