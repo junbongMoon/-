@@ -41,12 +41,19 @@ SERVICE_KEY = os.getenv("BUS_API_KEY")
 if not SERVICE_KEY:
     raise RuntimeError("환경변수 BUS_API_KEY가 없습니다. .env 또는 환경변수를 설정하세요.")
 
-# --- 노선 분류 ---
-CORE_ROUTES = [  # 항상 수집 대상(주말/공휴일 포함)
+# =========================
+# 노선 분류
+# =========================
+
+# 항상 수집 대상(주말/공휴일 포함) → 2개 그룹으로 분할
+CORE_ROUTES_A = [
     "100100389",  # 9401
     "113000004",  # 9401-1
     "100100391",  # 9404
     "100100392",  # 9408
+]
+
+CORE_ROUTES_B = [
     "107000005",  # 9409
     "100100400",  # 9707
     "100100607",  # 9711
@@ -65,7 +72,10 @@ SPECIAL_EVENING_ONLY = [  # 평일 18:00~21:00만
 ]
 
 DATA_DIR = Path("data")
-PER_REQUEST_SLEEP_SEC = 10.0
+
+# 10.0 유지 가능 / 조금 더 분산하려면 9.0도 가능
+PER_REQUEST_SLEEP_SEC = 9.0
+
 TIMEOUT = (5, 15)
 RETRIES = 0
 KST = ZoneInfo("Asia/Seoul")
@@ -258,98 +268,143 @@ def main():
         }
     )
 
+    core_all = CORE_ROUTES_A + CORE_ROUTES_B
+
     # =====================================================
     # 1) CORE_ROUTES
     #    - 주말/공휴일 포함 계속 수집
-    #    - 그래서 day_of_week 제거
+    #    - 2분 수집은 A/B 그룹으로 분할
     # =====================================================
 
     # 2분 수집: 아침
     scheduler.add_job(
-        lambda: collect_routes(CORE_ROUTES, "CORE 2-min MORNING"),
+        lambda: collect_routes(CORE_ROUTES_A, "CORE A 2-min MORNING"),
         trigger="cron",
         hour="6-10",
         minute="*/2",
         second=0,
+        id="core_a_2min_morning"
     )
 
-    # 2분 수집: 저녁
     scheduler.add_job(
-        lambda: collect_routes(CORE_ROUTES, "CORE 2-min EVENING (16:30~16:59)"),
+        lambda: collect_routes(CORE_ROUTES_B, "CORE B 2-min MORNING"),
+        trigger="cron",
+        hour="6-10",
+        minute="1-59/2",
+        second=0,
+        id="core_b_2min_morning"
+    )
+
+    # 2분 수집: 저녁 16:30~16:59
+    scheduler.add_job(
+        lambda: collect_routes(CORE_ROUTES_A, "CORE A 2-min EVENING (16:30~16:58)"),
         trigger="cron",
         hour="16",
-        minute="30-59/2",
+        minute="30-58/2",
         second=0,
+        id="core_a_2min_evening_1630"
     )
 
     scheduler.add_job(
-        lambda: collect_routes(CORE_ROUTES, "CORE 2-min EVENING (17~20)"),
+        lambda: collect_routes(CORE_ROUTES_B, "CORE B 2-min EVENING (16:31~16:59)"),
+        trigger="cron",
+        hour="16",
+        minute="31-59/2",
+        second=0,
+        id="core_b_2min_evening_1631"
+    )
+
+    # 2분 수집: 저녁 17~20
+    scheduler.add_job(
+        lambda: collect_routes(CORE_ROUTES_A, "CORE A 2-min EVENING (17~20)"),
         trigger="cron",
         hour="17-20",
         minute="*/2",
         second=0,
+        id="core_a_2min_evening_17_20"
     )
 
     scheduler.add_job(
-        lambda: collect_routes(CORE_ROUTES, "CORE EVENING END (21:00)"),
+        lambda: collect_routes(CORE_ROUTES_B, "CORE B 2-min EVENING (17~20)"),
+        trigger="cron",
+        hour="17-20",
+        minute="1-59/2",
+        second=0,
+        id="core_b_2min_evening_17_20"
+    )
+
+    # 21:00 종료용
+    scheduler.add_job(
+        lambda: collect_routes(core_all, "CORE ALL EVENING END (21:00)"),
         trigger="cron",
         hour="21",
         minute="0",
         second=0,
+        id="core_all_evening_end"
     )
 
-    # 5분 수집: 나머지 시간대
+    # =====================================================
+    # 2) CORE 5분 수집
+    #    - 5분 구간은 전체 노선 유지
+    # =====================================================
     scheduler.add_job(
-        lambda: collect_routes(CORE_ROUTES, "CORE 5-min (00~02)"),
+        lambda: collect_routes(core_all, "CORE 5-min (00~02)"),
         trigger="cron",
         hour="0-2",
         minute="*/5",
         second=0,
+        id="core_5min_00_02"
     )
 
     scheduler.add_job(
-        lambda: collect_routes(CORE_ROUTES, "CORE 5-min (05)"),
+        lambda: collect_routes(core_all, "CORE 5-min (05)"),
         trigger="cron",
         hour="5",
         minute="*/5",
         second=0,
+        id="core_5min_05"
     )
 
     scheduler.add_job(
-        lambda: collect_routes(CORE_ROUTES, "CORE 5-min (11~15)"),
+        lambda: collect_routes(core_all, "CORE 5-min (11~15)"),
         trigger="cron",
         hour="11-15",
         minute="*/5",
         second=0,
+        id="core_5min_11_15"
     )
 
     scheduler.add_job(
-        lambda: collect_routes(CORE_ROUTES, "CORE 5-min (16:00~16:29)"),
+        lambda: collect_routes(core_all, "CORE 5-min (16:00~16:29)"),
         trigger="cron",
         hour="16",
         minute="0-29/5",
         second=0,
+        id="core_5min_16_00_29"
     )
 
     scheduler.add_job(
-        lambda: collect_routes(CORE_ROUTES, "CORE 5-min (21:05~21:59)"),
+        lambda: collect_routes(core_all, "CORE 5-min (21:05~21:59)"),
         trigger="cron",
         hour="21",
         minute="5-59/5",
         second=0,
+        id="core_5min_21_05_59"
     )
 
     scheduler.add_job(
-        lambda: collect_routes(CORE_ROUTES, "CORE 5-min (22~23)"),
+        lambda: collect_routes(core_all, "CORE 5-min (22~23)"),
         trigger="cron",
         hour="22-23",
         minute="*/5",
         second=0,
+        id="core_5min_22_23"
     )
 
     # =====================================================
-    # 2) SPECIAL_MORNING_ONLY
+    # 3) SPECIAL_MORNING_ONLY
     #    - 스케줄은 걸어두되, 주말/공휴일이면 함수 내부에서 스킵
+    #    - 30초 offset 유지
     # =====================================================
     scheduler.add_job(
         lambda: collect_routes(
@@ -361,6 +416,7 @@ def main():
         hour="6",
         minute="30-59/2",
         second=30,
+        id="special_morning_0630_0659"
     )
 
     scheduler.add_job(
@@ -373,6 +429,7 @@ def main():
         hour="7-9",
         minute="*/2",
         second=30,
+        id="special_morning_07_09"
     )
 
     scheduler.add_job(
@@ -385,11 +442,13 @@ def main():
         hour="10",
         minute="0",
         second=30,
+        id="special_morning_end"
     )
 
     # =====================================================
-    # 3) SPECIAL_EVENING_ONLY
+    # 4) SPECIAL_EVENING_ONLY
     #    - 스케줄은 걸어두되, 주말/공휴일이면 함수 내부에서 스킵
+    #    - 30초 offset 유지
     # =====================================================
     scheduler.add_job(
         lambda: collect_routes(
@@ -401,6 +460,7 @@ def main():
         hour="18-20",
         minute="*/2",
         second=30,
+        id="special_evening_18_20"
     )
 
     scheduler.add_job(
@@ -413,17 +473,23 @@ def main():
         hour="21",
         minute="0",
         second=30,
+        id="special_evening_end"
     )
 
     print("Scheduler started.")
     print(" - CORE: runs every day including weekends/holidays.")
+    print(" - CORE 2-min: split into A/B groups to reduce burst.")
+    print(" - CORE 5-min: all core routes.")
     print(" - SPECIAL: skipped on weekends/holidays.")
     print(f"Saving CSV under: {DATA_DIR.resolve()}")
     print(f"PER_REQUEST_SLEEP_SEC={PER_REQUEST_SLEEP_SEC}, RATE_LIMIT_COOLDOWN_SEC={RATE_LIMIT_COOLDOWN_SEC}")
 
     print("\n[Registered Jobs]")
     for job in scheduler.get_jobs():
-        print(f" - {job}")
+        try:
+            print(f" - {job.id} | next_run_time={job.next_run_time}")
+        except Exception:
+            print(f" - {job}")
 
     try:
         scheduler.start()
