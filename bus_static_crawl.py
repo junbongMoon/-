@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 from datetime import datetime
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -12,11 +13,11 @@ from apscheduler.executors.pool import ThreadPoolExecutor
 # --- zoneinfo 처리: 3.9+면 zoneinfo, 아니면 backports.zoneinfo ---
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
-except ImportError:  # Python 3.8 이하
+except ImportError:
     from backports.zoneinfo import ZoneInfo  # pip install backports.zoneinfo
 
 from dotenv import load_dotenv
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 # =========================
 # (옵션) 공휴일 체크
@@ -44,8 +45,6 @@ if not SERVICE_KEY:
 # =========================
 # 노선 분류
 # =========================
-
-# 항상 수집 대상(주말/공휴일 포함) → 2개 그룹으로 분할
 CORE_ROUTES_A = [
     "100100389",  # 9401
     "113000004",  # 9401-1
@@ -72,16 +71,33 @@ SPECIAL_EVENING_ONLY = [  # 평일 18:00~21:00만
 ]
 
 DATA_DIR = Path("data")
-
-# 10.0 유지 가능 / 조금 더 분산하려면 9.0도 가능
-PER_REQUEST_SLEEP_SEC = 9.0
-
-TIMEOUT = (5, 15)
-RETRIES = 0
 KST = ZoneInfo("Asia/Seoul")
 
-# 호출 제한 감지 시 쿨다운
+TIMEOUT = (5, 15)
+RETRIES = 1
+
+# 개별 요청 사이 최소 간격(전역)
+GLOBAL_MIN_REQUEST_INTERVAL_SEC = 12.0
+
+# 한 회차(route loop) 시작 전 최소 간격
+GLOBAL_MIN_RUN_GAP_SEC = 20.0
+
+# 제한 오류 감지 시 전역 쿨다운
 RATE_LIMIT_COOLDOWN_SEC = 600
+
+# 네트워크 오류 시 재시도 전 대기
+RETRY_BACKOFF_BASE_SEC = 1.0
+
+# 프로그램 시작 직후 밀린 잡을 살리지 않도록 짧게
+MISFIRE_GRACE_SEC = 5
+
+# =========================
+# 전역 상태
+# =========================
+_api_gate_lock = threading.Lock()
+_last_request_monotonic = 0.0
+_last_run_monotonic = 0.0
+_block_api_until_monotonic = 0.0
 
 
 # =========================
@@ -91,15 +107,15 @@ def now_kst() -> datetime:
     return datetime.now(KST)
 
 
+def fmt_now() -> str:
+    return now_kst().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
 def is_workday_kst(ts: datetime) -> bool:
-    # 토/일 제외
     if ts.weekday() >= 5:
         return False
-
-    # 공휴일 제외(패키지 있을 때만)
     if KR_HOLIDAYS is not None and ts.date() in KR_HOLIDAYS:
         return False
-
     return True
 
 
@@ -112,26 +128,129 @@ def daily_csv_path(ts: datetime) -> Path:
     return DATA_DIR / f"bus_data_{ts.strftime('%Y_%m_%d')}.csv"
 
 
+def is_rate_limited_now() -> bool:
+    global _block_api_until_monotonic
+    return time.monotonic() < _block_api_until_monotonic
+
+
+def set_global_cooldown(seconds: int, reason: str = "") -> None:
+    global _block_api_until_monotonic
+    until = time.monotonic() + seconds
+    with _api_gate_lock:
+        if until > _block_api_until_monotonic:
+            _block_api_until_monotonic = until
+
+    msg = f"[{fmt_now()}] 🧊 GLOBAL COOLDOWN set for {seconds}s"
+    if reason:
+        msg += f" | reason={reason}"
+    print(msg)
+
+
+def wait_for_api_slot(kind: str = "request") -> None:
+    """
+    전역 기준으로 request / run 간격을 강제.
+    모든 job이 이 함수 하나를 거치도록 해서 연속 호출을 방지한다.
+    """
+    global _last_request_monotonic, _last_run_monotonic, _block_api_until_monotonic
+
+    while True:
+        sleep_sec = 0.0
+
+        with _api_gate_lock:
+            now_mono = time.monotonic()
+
+            # 전역 쿨다운 중이면 대기
+            if now_mono < _block_api_until_monotonic:
+                sleep_sec = _block_api_until_monotonic - now_mono
+
+            else:
+                if kind == "run":
+                    next_allowed = _last_run_monotonic + GLOBAL_MIN_RUN_GAP_SEC
+                    if now_mono < next_allowed:
+                        sleep_sec = next_allowed - now_mono
+                    else:
+                        _last_run_monotonic = now_mono
+                        return
+
+                else:  # request
+                    next_allowed = _last_request_monotonic + GLOBAL_MIN_REQUEST_INTERVAL_SEC
+                    if now_mono < next_allowed:
+                        sleep_sec = next_allowed - now_mono
+                    else:
+                        _last_request_monotonic = now_mono
+                        return
+
+        if sleep_sec > 0:
+            print(f"[{fmt_now()}] ⏳ wait {sleep_sec:.1f}s for global API slot ({kind})")
+            time.sleep(sleep_sec)
+        else:
+            time.sleep(0.1)
+
+
+def is_rate_limit_error_message(msg: str) -> bool:
+    upper = (msg or "").upper()
+    keywords = [
+        "LIMITED NUMBER OF SERVICE REQUESTS EXCEEDS",
+        "SERVICE REQUESTS EXCEEDS ERROR",
+        "HEADERCD=7",
+        "ERRORCODE=22",
+        "인증코드 에러(22)",
+    ]
+    return any(k in upper for k in keywords)
+
+
+def normalize_service_key(value: str) -> str:
+    """
+    .env에 이미 URL 인코딩된 값을 넣었든, 원문 키를 넣었든 requests가 알아서 처리하게 둔다.
+    '%2B', '%2F', '%3D' 등이 들어있는 경우 한 번 decode 후 전달하는 것이 안전하다.
+    """
+    from urllib.parse import unquote
+    return unquote(value.strip())
+
+
+SERVICE_KEY = normalize_service_key(SERVICE_KEY)
+
+
+# =========================
+# API 호출/파싱
+# =========================
 def fetch_route_xml(route_id: str) -> str:
     params = {
         "serviceKey": SERVICE_KEY,
         "busRouteId": route_id
     }
 
-    last_err = None
+    last_err: Optional[Exception] = None
+
     for attempt in range(RETRIES + 1):
+        wait_for_api_slot("request")
+
         try:
             r = requests.get(BASE_URL, params=params, timeout=TIMEOUT)
             r.raise_for_status()
 
             text = r.text.strip()
             if not text.startswith("<"):
-                raise ValueError(f"Non-XML response (first 120 chars): {text[:120]}")
+                raise RuntimeError(f"Non-XML response: {text[:200]}")
+
+            # 제한 메시지는 XML 안에 들어와도 여기서 한 번 빠르게 감지
+            if "LIMITED NUMBER OF SERVICE REQUESTS EXCEEDS" in text.upper():
+                raise RuntimeError("API error headerCd=7, msg=LIMITED NUMBER OF SERVICE REQUESTS EXCEEDS")
+
             return text
 
         except Exception as e:
             last_err = e
-            time.sleep(0.5 * (attempt + 1))
+            msg = str(e)
+
+            if is_rate_limit_error_message(msg):
+                set_global_cooldown(RATE_LIMIT_COOLDOWN_SEC, reason=msg)
+                raise RuntimeError(msg)
+
+            if attempt < RETRIES:
+                backoff = RETRY_BACKOFF_BASE_SEC * (attempt + 1)
+                print(f"[{fmt_now()}] retry route_id={route_id} after {backoff:.1f}s | err={msg}")
+                time.sleep(backoff)
 
     raise RuntimeError(f"Failed route_id={route_id}: {last_err}")
 
@@ -155,6 +274,9 @@ def parse_items_from_xml(xml_text: str) -> List[Dict]:
     return items
 
 
+# =========================
+# CSV 저장
+# =========================
 def get_existing_csv_columns(csv_path: Path) -> List[str]:
     if not csv_path.exists():
         return []
@@ -205,12 +327,19 @@ def append_rows_to_daily_csv(rows: List[Dict], ts: datetime):
 def collect_routes(route_ids: List[str], label: str, skip_on_holiday: bool = False):
     ts0 = now_kst()
 
-    # SPECIAL 전용: 주말/공휴일이면 스킵
     if skip_on_holiday and not is_workday_kst(ts0):
-        print(f"\n[{ts0.strftime('%Y-%m-%d %H:%M:%S %Z')}] SKIP (weekend/holiday) | {label}")
+        print(f"\n[{fmt_now()}] SKIP (weekend/holiday) | {label}")
         return
 
-    print(f"\n[{ts0.strftime('%Y-%m-%d %H:%M:%S %Z')}] Collect start | {label}")
+    # 쿨다운 중이면 회차 자체 skip
+    if is_rate_limited_now():
+        print(f"\n[{fmt_now()}] SKIP (global cooldown active) | {label}")
+        return
+
+    # run 시작도 전역 간격 제어
+    wait_for_api_slot("run")
+
+    print(f"\n[{fmt_now()}] Collect start | {label}")
 
     ok = 0
     fail = 0
@@ -218,7 +347,13 @@ def collect_routes(route_ids: List[str], label: str, skip_on_holiday: bool = Fal
     last_out_path = None
 
     for route_id in route_ids:
+        # 도중에 다른 job/요청에서 쿨다운 걸린 경우 즉시 중단
+        if is_rate_limited_now():
+            print(f"  🧊 stop current run because global cooldown is active | route_id={route_id}")
+            break
+
         ts = now_kst()
+
         try:
             xml = fetch_route_xml(route_id)
             rows = parse_items_from_xml(xml)
@@ -235,17 +370,13 @@ def collect_routes(route_ids: List[str], label: str, skip_on_holiday: bool = Fal
         except Exception as e:
             fail += 1
             msg = str(e)
-            print(f"  ❌ {route_id} error -> {e}")
+            print(f"  ❌ {route_id} error -> {msg}")
 
-            # 호출 제한 감지 시 이번 회차 중단
-            if ("LIMITED NUMBER OF SERVICE REQUESTS EXCEEDS" in msg) or ("headerCd=7" in msg):
-                print(f"  🧊 Rate limit detected. Cooldown {RATE_LIMIT_COOLDOWN_SEC}s then stop this run.")
-                time.sleep(RATE_LIMIT_COOLDOWN_SEC)
+            if is_rate_limit_error_message(msg):
+                print(f"  🧊 Rate limit detected. Stop this run immediately.")
                 break
 
-        time.sleep(PER_REQUEST_SLEEP_SEC)
-
-    done_at = now_kst().strftime("%Y-%m-%d %H:%M:%S %Z")
+    done_at = fmt_now()
     if last_out_path:
         print(f"[{done_at}] Collect done | {label} | ok={ok}, fail={fail}, rows={total_rows} (last file: {last_out_path})")
     else:
@@ -264,7 +395,7 @@ def main():
         job_defaults={
             "coalesce": True,
             "max_instances": 1,
-            "misfire_grace_time": 60
+            "misfire_grace_time": MISFIRE_GRACE_SEC
         }
     )
 
@@ -345,7 +476,6 @@ def main():
 
     # =====================================================
     # 2) CORE 5분 수집
-    #    - 5분 구간은 전체 노선 유지
     # =====================================================
     scheduler.add_job(
         lambda: collect_routes(core_all, "CORE 5-min (00~02)"),
@@ -403,7 +533,7 @@ def main():
 
     # =====================================================
     # 3) SPECIAL_MORNING_ONLY
-    #    - 스케줄은 걸어두되, 주말/공휴일이면 함수 내부에서 스킵
+    #    - 주말/공휴일 스킵
     #    - 30초 offset 유지
     # =====================================================
     scheduler.add_job(
@@ -447,8 +577,6 @@ def main():
 
     # =====================================================
     # 4) SPECIAL_EVENING_ONLY
-    #    - 스케줄은 걸어두되, 주말/공휴일이면 함수 내부에서 스킵
-    #    - 30초 offset 유지
     # =====================================================
     scheduler.add_job(
         lambda: collect_routes(
@@ -478,11 +606,14 @@ def main():
 
     print("Scheduler started.")
     print(" - CORE: runs every day including weekends/holidays.")
-    print(" - CORE 2-min: split into A/B groups to reduce burst.")
+    print(" - CORE 2-min: split into A/B groups.")
     print(" - CORE 5-min: all core routes.")
     print(" - SPECIAL: skipped on weekends/holidays.")
     print(f"Saving CSV under: {DATA_DIR.resolve()}")
-    print(f"PER_REQUEST_SLEEP_SEC={PER_REQUEST_SLEEP_SEC}, RATE_LIMIT_COOLDOWN_SEC={RATE_LIMIT_COOLDOWN_SEC}")
+    print(f"GLOBAL_MIN_REQUEST_INTERVAL_SEC={GLOBAL_MIN_REQUEST_INTERVAL_SEC}")
+    print(f"GLOBAL_MIN_RUN_GAP_SEC={GLOBAL_MIN_RUN_GAP_SEC}")
+    print(f"RATE_LIMIT_COOLDOWN_SEC={RATE_LIMIT_COOLDOWN_SEC}")
+    print(f"MISFIRE_GRACE_SEC={MISFIRE_GRACE_SEC}")
 
     print("\n[Registered Jobs]")
     for job in scheduler.get_jobs():
